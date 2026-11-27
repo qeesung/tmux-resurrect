@@ -44,5 +44,9 @@ overwrite_option="@resurrect-never-overwrite"
 # Hooks are set via ${hook_prefix}${name}, i.e. "@resurrect-hook-post-save-all"
 hook_prefix="@resurrect-hook-"
 
+# set to 'on' to resume Claude Code / Antigravity CLI conversations per pane
+agent_sessions_option="@resurrect-agent-sessions"
+default_agent_sessions="off"
+
 delete_backup_after_option="@resurrect-delete-backup-after"
 default_delete_backup_after="30" # days

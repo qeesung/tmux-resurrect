@@ -19,7 +19,10 @@ restore_pane_process() {
 		tmux select-pane -t "$pane_index"
 
 		local inline_strategy="$(_get_inline_strategy "$pane_full_command")" # might not be defined
-		if [ -n "$inline_strategy" ]; then
+		if agent_sessions_enabled && is_agent_resume_command "$pane_full_command"; then
+			# saved as `<agent> <flags> --resume <id>`, replay it as is
+			command="$pane_full_command"
+		elif [ -n "$inline_strategy" ]; then
 			# inline strategy exists
 			# check for additional "expansion" of inline strategy, e.g. `vim` to `vim -S`
 			if _strategy_exists "$inline_strategy"; then
@@ -53,6 +56,8 @@ _process_should_be_restored() {
 	elif ! pane_exists "$session_name" "$window_number" "$pane_index"; then
 		# pane number limit exceeded, pane does not exist
 		return 1
+	elif agent_sessions_enabled && is_agent_resume_command "$pane_full_command"; then
+		return 0
 	elif _restore_all_processes; then
 		return 0
 	elif _process_on_the_restore_list "$pane_full_command"; then

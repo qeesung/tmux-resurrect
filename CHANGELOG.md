@@ -1,6 +1,8 @@
 # Changelog
 
 ### master
+- Optionally resume Claude Code (`claude`) and Antigravity CLI (`agy`)
+  conversations per pane: `set -g @resurrect-agent-sessions 'on'`.
 - Remove deprecated "restoring shell history" feature.
 
 ### v4.0.0, 2022-04-10

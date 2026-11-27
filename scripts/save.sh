@@ -5,6 +5,7 @@ CURRENT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 source "$CURRENT_DIR/variables.sh"
 source "$CURRENT_DIR/helpers.sh"
 source "$CURRENT_DIR/spinner_helpers.sh"
+source "$CURRENT_DIR/agent_sessions_helpers.sh"
 
 # delimiters
 d=$'\t'
@@ -188,6 +189,11 @@ fetch_and_dump_grouped_sessions(){
 # translates pane pid to process command running inside a pane
 dump_panes() {
 	local full_command
+	local agent_sessions=""
+	if agent_sessions_enabled; then
+		agent_sessions="on"
+		AGENT_PS_TABLE="$(agent_process_table)"
+	fi
 	dump_panes_raw |
 		while IFS=$d read line_type session_name window_number window_active window_flags pane_index pane_title dir pane_active pane_command pane_pid history_size; do
 			# not saving panes from grouped sessions
@@ -195,6 +201,10 @@ dump_panes() {
 				continue
 			fi
 			full_command="$(pane_full_command $pane_pid)"
+			if [ -n "$agent_sessions" ] && agent_pane_command "$pane_pid"; then
+				full_command="$AGENT_COMMAND"
+				[ -n "$AGENT_CWD" ] && dir=":$AGENT_CWD"
+			fi
 			dir=$(echo $dir | sed 's/ /\\ /') # escape all spaces in directory path
 			echo "${line_type}${d}${session_name}${d}${window_number}${d}${window_active}${d}${window_flags}${d}${pane_index}${d}${pane_title}${d}${dir}${d}${pane_active}${d}${pane_command}${d}:${full_command}"
 		done
