@@ -192,7 +192,7 @@ dump_panes() {
 	local agent_sessions=""
 	if agent_sessions_enabled; then
 		agent_sessions="on"
-		AGENT_PS_TABLE="$(agent_process_table)"
+		AGENT_CANDIDATES="$(agent_candidates $(tmux list-panes -a -F '#{pane_pid}'))"
 	fi
 	dump_panes_raw |
 		while IFS=$d read line_type session_name window_number window_active window_flags pane_index pane_title dir pane_active pane_command pane_pid history_size; do

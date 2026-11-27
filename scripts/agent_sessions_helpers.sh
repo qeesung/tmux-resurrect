@@ -11,6 +11,9 @@
 #   claude  $CLAUDE_CONFIG_DIR/sessions/<pid>.json, kept up to date by Claude Code
 #   agy     the presence/<conversation id>.lock the agy process holds open
 
+# separates fields that may be empty (tab is IFS whitespace and would collapse)
+_agent_sep=$'\x1f'
+
 agent_sessions_enabled() {
 	[ "$(get_tmux_option "$agent_sessions_option" "$default_agent_sessions")" == "on" ]
 }
@@ -23,50 +26,56 @@ _agent_agy_dir() {
 	echo "$HOME/.gemini/antigravity-cli"
 }
 
-# "pid<space>ppid<space>args" for every process; computed once per save.
 agent_process_table() {
-	ps -Ao pid=,ppid=,args=
+	if [ -n "${AGENT_PS_TABLE-}" ]; then
+		echo "$AGENT_PS_TABLE"
+	else
+		ps -Ao pid=,ppid=,args=
+	fi
 }
 
-# Descendants of a pane's shell as "pid<TAB>args", breadth first, so the agent
-# is found before the shells and tools it spawns.
-_agent_descendants() {
-	local root="$1"
-	local table="${AGENT_PS_TABLE:-$(agent_process_table)}"
-	echo "$table" | awk -v root="$root" '
+# Processes that may be agents, as "pane_pid<TAB>depth<TAB>pid<TAB>args",
+# shallowest first, for the given pane pids. One ps + awk for all panes; the
+# shallowest match per pane is the agent itself, not a tool it spawned.
+agent_candidates() {
+	agent_process_table | awk -v roots="$*" '
+		BEGIN { n = split(roots, r, " "); for (i = 1; i <= n; i++) root[r[i]] = 1 }
 		{
 			pid = $1; ppid = $2; $1 = ""; $2 = ""
 			args[pid] = substr($0, 3)
-			kids[ppid] = kids[ppid] " " pid
+			parent[pid] = ppid
 		}
 		END {
-			n = split(kids[root], level, " ")
-			for (depth = 0; depth < 3 && n > 0; depth++) {
-				m = 0
-				for (i = 1; i <= n; i++) {
-					p = level[i]
-					print p "\t" args[p]
-					c = split(kids[p], found, " ")
-					for (j = 1; j <= c; j++) next_level[++m] = found[j]
+			for (pid in args) {
+				if (args[pid] !~ /claude|agy/) continue
+				p = pid
+				for (depth = 1; depth <= 3; depth++) {
+					p = parent[p]
+					if (p in root) { print p "\t" depth "\t" pid "\t" args[pid]; break }
 				}
-				for (i = 1; i <= m; i++) level[i] = next_level[i]
-				n = m
 			}
-		}'
+		}' | sort -t "$(printf '\t')" -k1,1n -k2,2n
 }
 
-# Top-level string/number value of a flat JSON object.
-_agent_json_value() {
+# Top-level values of a flat JSON object, joined by $_agent_sep.
+_agent_json_fields() {
 	local file="$1"
-	local key="$2"
+	shift
 	if command -v jq >/dev/null 2>&1; then
-		jq -r --arg k "$key" '.[$k] // empty | tostring' "$file" 2>/dev/null
+		jq -r --arg sep "$_agent_sep" \
+			'. as $o | [$ARGS.positional[] | $o[.] // "" | tostring] | join($sep)' \
+			"$file" --args "$@" 2>/dev/null
 	else
 		# Top-level keys precede nested objects in these files, so the first
-		# occurrence is the top-level one.
-		grep -o "\"$key\":\"\{0,1\}[^\",}]*" "$file" 2>/dev/null |
-			head -1 |
-			sed "s/^\"$key\":\"\{0,1\}//"
+		# occurrence of a key is the top-level one.
+		local key out="" first=1
+		for key in "$@"; do
+			[ "$first" == 1 ] || out="$out$_agent_sep"
+			first=0
+			out="$out$(grep -o "\"$key\":\"\{0,1\}[^\",}]*" "$file" 2>/dev/null |
+				head -1 | sed "s/^\"$key\":\"\{0,1\}//")"
+		done
+		echo "$out"
 	fi
 }
 
@@ -91,11 +100,11 @@ _agent_claude_session() {
 	[ -f "$file" ] || return 1
 	# guard against a stale file whose pid got reused by another program
 	[[ "$args" == *claude* ]] || return 1
-	[ "$(_agent_json_value "$file" pid)" == "$pid" ] || return 1
-	local kind="$(_agent_json_value "$file" kind)"
+	local json_pid kind
+	IFS="$_agent_sep" read -r json_pid kind AGENT_ID AGENT_CWD \
+		<<< "$(_agent_json_fields "$file" pid kind sessionId cwd)"
+	[ "$json_pid" == "$pid" ] || return 1
 	[ -z "$kind" ] || [ "$kind" == "interactive" ] || return 1
-	AGENT_ID="$(_agent_json_value "$file" sessionId)"
-	AGENT_CWD="$(_agent_json_value "$file" cwd)"
 	# a conversation without any message has no transcript and can't be resumed
 	if [ -n "$AGENT_ID" ] && ! compgen -G "$dir/projects/*/$AGENT_ID.jsonl" >/dev/null; then
 		AGENT_ID=""
@@ -110,13 +119,13 @@ _agent_agy_session() {
 	local first="${args%% *}"
 	[ "${first##*/}" == "agy" ] || return 1
 	local dir="$(_agent_agy_dir)"
-	local path id newest=""
+	local path id db newest=""
 	while read -r path; do
 		case "$path" in
 			"$dir/presence/"*.lock)
 				id="${path##*/}"
 				id="${id%.lock}"
-				local db="$dir/conversations/$id.db"
+				db="$dir/conversations/$id.db"
 				if [ -f "$db" ] && { [ -z "$newest" ] || [ "$db" -nt "$newest" ]; }; then
 					newest="$db"
 				fi
@@ -158,7 +167,9 @@ _agent_flag_takes_optional_value() {
 # Prints "<agent> <flags>" rebuilt from a full command line: resume selectors
 # and one-shot actions are dropped (the caller appends its own --resume), as
 # are positional arguments, i.e. an initial prompt that must not run again.
-# Fails for print mode, which is not an interactive session.
+# Repeated flags are kept once: a shell alias such as
+# `agy='agy --dangerously-skip-permissions'` adds its flags again on every
+# restore. Fails for print mode, which is not an interactive session.
 agent_rebuild_command() {
 	local agent="$1"
 	local args="$2"
@@ -166,54 +177,68 @@ agent_rebuild_command() {
 	local -a out
 	read -ra argv <<< "$args"
 	out=("$agent")
+	local seen=$'\n'
 	local i=1
 	local n=${#argv[@]}
-	local tok name next
+	local tok name next entry take
 	while [ "$i" -lt "$n" ]; do
 		tok="${argv[$i]}"
 		name="${tok%%=*}"
 		next="${argv[$((i + 1))]-}"
+		take=1
 		case "$name" in
 			-p|--print|--prompt)
 				return 1 ;;
 			-c|--continue|--fork-session)
-				i=$((i + 1)) ;;
+				take=0; i=$((i + 1)) ;;
 			--session-id|--conversation|-n|--name)
+				take=0
 				if [[ "$tok" == *=* ]]; then i=$((i + 1)); else i=$((i + 2)); fi ;;
 			-r|--resume|-w|--worktree|--teleport|--from-pr|--cloud)
+				take=0
 				if [[ "$tok" != *=* && -n "$next" && "$next" != -* ]]; then
 					i=$((i + 2))
 				else
 					i=$((i + 1))
 				fi ;;
-			*)
-				if [[ "$tok" != -* ]]; then
-					i=$((i + 1))
-				elif [[ "$tok" != *=* ]] && _agent_flag_takes_value "$tok" && [ -n "$next" ]; then
-					out+=("$tok" "$next")
-					i=$((i + 2))
-				elif [[ "$tok" != *=* ]] && _agent_flag_takes_optional_value "$tok" &&
-					[[ -n "$next" && "$next" != -* ]]; then
-					out+=("$tok" "$next")
-					i=$((i + 2))
-				else
-					out+=("$tok")
-					i=$((i + 1))
-				fi ;;
 		esac
+		[ "$take" == 1 ] || continue
+		if [[ "$tok" != -* ]]; then
+			i=$((i + 1))
+			continue
+		fi
+		if [[ "$tok" != *=* ]] && { { _agent_flag_takes_value "$tok" && [ -n "$next" ]; } ||
+			{ _agent_flag_takes_optional_value "$tok" && [[ -n "$next" && "$next" != -* ]]; }; }; then
+			entry="$tok $next"
+			i=$((i + 2))
+		else
+			entry="$tok"
+			i=$((i + 1))
+		fi
+		case "$seen" in
+			*$'\n'"$entry"$'\n'*) continue ;;
+		esac
+		seen="$seen$entry"$'\n'
+		if [ "$entry" == "$tok" ]; then
+			out+=("$tok")
+		else
+			out+=("$tok" "$next")
+		fi
 	done
 	printf '%q ' "${out[@]}" | sed 's/ $//'
 }
 
 # Sets AGENT_COMMAND (and AGENT_CWD when the agent knows its project dir) and
-# succeeds if the pane runs a resumable agent.
+# succeeds if the pane runs a resumable agent. Uses $AGENT_CANDIDATES when the
+# caller computed it for all panes at once.
 agent_pane_command() {
 	local pane_pid="$1"
-	local pid args agent command
+	local candidates="${AGENT_CANDIDATES-$(agent_candidates "$pane_pid")}"
+	local root depth pid args agent command
 	AGENT_COMMAND=""
 	AGENT_CWD=""
-	while IFS=$'\t' read -r pid args; do
-		[ -n "$pid" ] || continue
+	while IFS=$'\t' read -r root depth pid args; do
+		[ "$root" == "$pane_pid" ] || continue
 		AGENT_ID=""
 		AGENT_CWD=""
 		if _agent_claude_session "$pid" "$args"; then
@@ -229,7 +254,7 @@ agent_pane_command() {
 		fi
 		AGENT_COMMAND="$command"
 		return 0
-	done <<< "$(_agent_descendants "$pane_pid")"
+	done <<< "$candidates"
 	return 1
 }
 

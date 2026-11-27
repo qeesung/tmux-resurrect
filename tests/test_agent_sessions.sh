@@ -54,23 +54,23 @@ check_fails "agy print mode is not restored" agent_rebuild_command agy 'agy --pr
 quoted="$(agent_rebuild_command claude 'claude --settings {"a":1}')"
 eval "set -- $quoted"
 check "shell quoting round-trips" '{"a":1}' "$3"
+check "alias-repeated flags kept once" "agy --dangerously-skip-permissions --add-dir /a --add-dir /b" \
+	"$(agent_rebuild_command agy 'agy --dangerously-skip-permissions --dangerously-skip-permissions --add-dir /a --add-dir /b --add-dir /a --resume x')"
 
-# --- _agent_json_value -------------------------------------------------------
+# --- _agent_json_fields ------------------------------------------------------
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 json="$TMP_DIR/sample.json"
 echo '{"pid":200,"sessionId":"top","cwd":"/work/a","kind":"interactive","formerNames":[{"name":"x","sessionId":"old"}]}' > "$json"
 
-check "json via jq" "top" "$(_agent_json_value "$json" sessionId)"
-check "json number" "200" "$(_agent_json_value "$json" pid)"
+expected="200${_agent_sep}${_agent_sep}top${_agent_sep}/work/a"
+check "json via jq" "$expected" "$(_agent_json_fields "$json" pid missing sessionId cwd)"
 no_jq() {
 	command() { [ "$2" == "jq" ] && return 1; builtin command "$@"; }
-	_agent_json_value "$@"
+	_agent_json_fields "$@"
 }
-check "json without jq" "top" "$(no_jq "$json" sessionId)"
-check "json number without jq" "200" "$(no_jq "$json" pid)"
-check "json path without jq" "/work/a" "$(no_jq "$json" cwd)"
+check "json without jq" "$expected" "$(no_jq "$json" pid missing sessionId cwd)"
 
 # --- agent_pane_command ------------------------------------------------------
 
@@ -84,6 +84,9 @@ touch "$CLAUDE_CONFIG_DIR/projects/-work-a/S1.jsonl"
 echo '{"pid":250,"sessionId":"EMPTY","cwd":"/work/b","kind":"interactive"}' > "$CLAUDE_CONFIG_DIR/sessions/250.json"
 echo '{"pid":600,"sessionId":"P1","cwd":"/work/a","kind":"interactive"}' > "$CLAUDE_CONFIG_DIR/sessions/600.json"
 echo '{"pid":800,"sessionId":"STALE","cwd":"/work/a","kind":"interactive"}' > "$CLAUDE_CONFIG_DIR/sessions/800.json"
+echo '{"pid":950,"sessionId":"S1","cwd":"/work/a"}' > "$CLAUDE_CONFIG_DIR/sessions/950.json"
+echo '{"pid":1002,"sessionId":"S1","cwd":"/work/a","kind":"interactive"}' > "$CLAUDE_CONFIG_DIR/sessions/1002.json"
+echo '{"pid":1102,"sessionId":"S1","cwd":"/work/a","kind":"print"}' > "$CLAUDE_CONFIG_DIR/sessions/1102.json"
 touch "$HOME/.gemini/antigravity-cli/conversations/C1.db"
 
 _agent_open_files() {
@@ -94,7 +97,7 @@ _agent_open_files() {
 
 AGENT_PS_TABLE="100 1 -zsh
 200 100 claude --dangerously-skip-permissions
-201 200 /bin/zsh -c sleep 1
+201 200 /bin/zsh -c claude mcp list
 150 1 -zsh
 250 150 claude
 300 1 -zsh
@@ -104,20 +107,40 @@ AGENT_PS_TABLE="100 1 -zsh
 500 1 -zsh
 600 500 claude -p hello
 700 1 -zsh
-800 700 vim notes"
+800 700 vim notes
+900 1 -zsh
+950 900 node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js --model opus
+1000 1 -zsh
+1001 1000 caffeinate -i claude --dangerously-skip-permissions
+1002 1001 claude --dangerously-skip-permissions
+1100 1 -zsh
+1102 1100 claude --output-format json"
 
-agent_pane_command 100
-check "claude pane" "claude --dangerously-skip-permissions --resume S1" "$AGENT_COMMAND"
-check "claude cwd" "/work/a" "$AGENT_CWD"
-agent_pane_command 150
-check "claude without transcript starts fresh" "claude" "$AGENT_COMMAND"
-agent_pane_command 300
-check "agy pane" "agy --dangerously-skip-permissions --resume C1" "$AGENT_COMMAND"
-agent_pane_command 350
-check "agy without conversation starts fresh" "agy" "$AGENT_COMMAND"
-check_fails "claude print pane is kept as is" agent_pane_command 500
-check_fails "stale session file with reused pid" agent_pane_command 700
-check_fails "pane without agent" agent_pane_command 999
+pane_checks() {
+	local mode="$1"
+
+	agent_pane_command 100
+	check "$mode: claude pane" "claude --dangerously-skip-permissions --resume S1" "$AGENT_COMMAND"
+	check "$mode: claude cwd" "/work/a" "$AGENT_CWD"
+	agent_pane_command 150
+	check "$mode: claude without transcript starts fresh" "claude" "$AGENT_COMMAND"
+	agent_pane_command 300
+	check "$mode: agy pane" "agy --dangerously-skip-permissions --resume C1" "$AGENT_COMMAND"
+	agent_pane_command 350
+	check "$mode: agy without conversation starts fresh" "agy" "$AGENT_COMMAND"
+	check_fails "$mode: claude print pane is kept as is" agent_pane_command 500
+	check_fails "$mode: stale session file with reused pid" agent_pane_command 700
+	check_fails "$mode: pane without agent" agent_pane_command 999
+	agent_pane_command 900
+	check "$mode: node-installed claude" "claude --model opus --resume S1" "$AGENT_COMMAND"
+	agent_pane_command 1000
+	check "$mode: claude behind a wrapper" "claude --dangerously-skip-permissions --resume S1" "$AGENT_COMMAND"
+	check_fails "$mode: non-interactive claude" agent_pane_command 1100
+}
+pane_checks single
+AGENT_CANDIDATES="$(agent_candidates 100 150 300 350 500 700 900 1000 1100)"
+pane_checks cached
+unset AGENT_CANDIDATES
 
 # --- is_agent_resume_command -------------------------------------------------
 
